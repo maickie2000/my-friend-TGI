@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+
+# Ejecutables
+*.exe
+
+# Logs
+*.log
+
+# Resultados generados
+output/
+logs/
+versions/
+
+# Archivos temporales
+*.ui~
+*.tmp
+
+# Entornos virtuales (si usas en el futuro)
+env/
+venv/
+
+# Configuraciones del sistema
+.DS_Store
