@@ -1,31 +1,25 @@
+#Importacion de librerias
 import sys
-from PyQt6.QtWidgets import QApplication, QMainWindow, QPushButton
-from PyQt6 import uic
-from modules.excel.gui_excel_tool import ExcelTool
 import os
+from PyQt6.QtWidgets import QApplication, QMainWindow, QPushButton, QTabWidget
+from PyQt6 import uic
+#Importacion de modulos
+from modules.excel.excel_widget import ExcelWidget
+from modules.flow2d.flow2d_widget import Flow2DWidget
+class Launcher(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("My Friend TGI")
+        self.setGeometry(100, 100, 1200, 700)
 
-# ⚠️ Agregamos una variable global para mantener la ventana del módulo
-ventana_modulo_excel = None
+        # Crear contenedor de pestañas
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
 
-def iniciar_aplicacion():
-    app = QApplication(sys.argv)
+        # Agregar pestaña de Excel
+        self.excel_tab = ExcelWidget()
+        self.tabs.addTab(self.excel_tab, "Excel")
 
-    ruta_ui = os.path.join(os.path.dirname(__file__), "launcher.ui")
-    ventana = uic.loadUi(ruta_ui)
-
-    ventana.setWindowTitle("My Friend TGI - Menú Principal")
-    
-    # Conectar botón del launcher
-    ventana.btn_excel.clicked.connect(mostrar_modulo_excel)
-
-    ventana.show()
-    sys.exit(app.exec())
-
-def mostrar_modulo_excel():
-    global ventana_modulo_excel
-    if ventana_modulo_excel is None or not ventana_modulo_excel.isVisible():
-        ventana_modulo_excel = ExcelTool()
-        ventana_modulo_excel.show()
-    else:
-        ventana_modulo_excel.raise_()
-        ventana_modulo_excel.activateWindow()
+        # Agregar pestaña de Flow 2D
+        self.flow2d_tab = Flow2DWidget()
+        self.tabs.addTab(self.flow2d_tab, "Flow 2D")
