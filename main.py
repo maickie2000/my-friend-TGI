@@ -1,3 +1,4 @@
-# Punto de entrada
-if __name__ == '__main__':
-    print('Bienvenido a My Friend TGI')
+from gui.launcher import iniciar_aplicacion
+
+if __name__ == "__main__":
+    iniciar_aplicacion()
