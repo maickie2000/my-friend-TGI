@@ -1,6 +1,6 @@
-"""Widget principal para el módulo Flow 2D en la interfaz de My Friend TGI."""
+"""Widget principal para la generación de hidrogramas con Cv en la interfaz de My Friend TGI."""
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel # type: ignore
-class Flow2DWidget(QWidget):
+class HidrogramasCvWidget(QWidget):
     """Interfaz gráfica para el módulo Flow 2D de My Friend TGI."""
     def __init__(self):
         super().__init__()

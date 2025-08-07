@@ -1,5 +1,5 @@
 """Módulo que contiene la interfaz de usuario para el procesamiento de archivos Excel."""
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog, QMessageBox #pylint: disable=no-name-in-module
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton, QFileDialog, QMessageBox # type: ignore
 
 class ExcelWidget(QWidget):
     """Interfaz gráfica para el módulo Excel de My Friend TGI."""
