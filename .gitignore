@@ -26,3 +26,4 @@ venv/
 
 # Configuraciones del sistema
 .DS_Store
+Thumbs.db
