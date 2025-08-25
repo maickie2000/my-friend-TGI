@@ -16,6 +16,11 @@ _Q_RE = re.compile(r"Q\s*=\s*([+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)\s*([A-Za-z0-9
 WANTED = ["ELEM", "STATION", "BEDEL", "DEPTH", "WSEL",
           "VEL_NORM", "FROUDE", "QS_NORM"]
 
+class ParseCancelled(Exception):
+    """Señal interna para cortar parsing por cancelación del usuario."""
+    pass
+
+
 def _next_nonempty(it) -> str:
     for line in it:
         s = line.strip()
@@ -115,16 +120,9 @@ def _build_df_from_rows(header_line: str, units_line: str, data_rows: List[str])
     return df, units_dict
 
 
-
+"""
 def parse_xseci(path: str | Path) -> Dict[str, Dict[str, Any]]:
-    """
-    Retorna: data[time_label][section_id] = {
-        "coords_text": str,
-        "Q": float | None,
-        "Q_units": str | None,
-        "df": DataFrame con columnas WANTED (las disponibles)
-    }
-    """
+    
     path = Path(path)
     data: Dict[str, Dict[str, Any]] = {}
     current_time: str | None = None
@@ -215,3 +213,130 @@ def parse_xseci(path: str | Path) -> Dict[str, Dict[str, Any]]:
                 break
 
     return data
+
+"""
+
+# parse_xseci(path, progress_cb=None, cancel_cb=None)
+# - progress_cb(done_bytes:int, total_bytes:int) -> None
+# - cancel_cb() -> bool  # True si hay que cancelar
+
+def parse_xseci(path: str | Path,
+                progress_cb=None,
+                cancel_cb=None) -> Dict[str, Dict[str, Any]]:
+        
+    path = Path(path)
+    total_bytes = path.stat().st_size if path.exists() else 0
+    if progress_cb and total_bytes > 0:
+        progress_cb(0, total_bytes)      # tick inicial (0%)
+    
+    done_bytes = 0
+
+    def _tick_progress(new_bytes: int = 0):
+        nonlocal done_bytes
+        done_bytes += new_bytes
+        if progress_cb and total_bytes > 0:
+            progress_cb(done_bytes, total_bytes)
+        if cancel_cb and cancel_cb():
+            raise ParseCancelled()
+
+    data: Dict[str, Dict[str, Any]] = {}
+    current_time: str | None = None
+
+       
+
+    with path.open("r", encoding="utf-8", errors="ignore") as f:
+        # leemos línea a línea para medir bytes
+        def _safe_readline():
+            line = f.readline()
+            if not line:
+                raise EOFError
+            _tick_progress(len(line.encode("utf-8", errors="ignore")))
+            return line
+
+        # reimplementa tu _next_nonempty pero usando _safe_readline()
+        def _next_nonempty():
+            while True:
+                s = _safe_readline()
+                s2 = s.strip()
+                if s2:
+                    return s2
+
+        # --- aquí reutiliza tu lógica actual, pero usa _next_nonempty()
+        # y donde iteres líneas, llama a _safe_readline() para sumar bytes.
+        # Cuando cierres un bloque de sección/tiempo, no olvides que _tick_progress
+        # ya lo estás llamando por cada línea leída.
+
+        # Saltar encabezados hasta TIME o CROSS SECTION RESULTS
+        while True:
+            try:
+                line = _next_nonempty()
+            except EOFError:
+                return data
+            if line.upper().startswith("TIME:") or "CROSS SECTION RESULTS" in line.upper():
+                first = line
+                break
+
+        line = first
+        while True:
+            try:
+                if line.upper().startswith("TIME:"):
+                    current_time = _parse_time_label(line)  # tu función actual
+                    data.setdefault(current_time, {})
+                    line = _next_nonempty()
+                    continue
+
+                m = _SECT_RE.search(line)  # tu regex actual
+                if m:
+                    sect_id = m.group(2)
+                    coords_line = _next_nonempty()
+                    header_line = _next_nonempty()
+                    units_line  = _next_nonempty()
+
+                    rows: list[str] = []
+                    while True:
+                        candidate = _next_nonempty()
+                        u = candidate.upper()
+                        if u.startswith("Q"):
+                            q_match = _Q_RE.search(candidate)
+                            Q_val   = float(q_match.group(1)) if q_match else None
+                            Q_units = q_match.group(2) if (q_match and q_match.group(2)) else None
+                            df, units = _build_df_from_rows(header_line, units_line, rows)
+                            if current_time is None:
+                                current_time = "Unknown"
+                                data.setdefault(current_time, {})
+                            data[current_time][sect_id] = {
+                                "coords_text": coords_line.strip(),
+                                "Q": Q_val,
+                                "Q_units": Q_units,
+                                "units": units,
+                                "df": df,
+                            }
+                            try:
+                                line = _next_nonempty()
+                            except EOFError:
+                                line = ""
+                            break
+                        if u.startswith("CROSS SECTION NO.") or u.startswith("TIME:"):
+                            df, units = _build_df_from_rows(header_line, units_line, rows)
+                            if current_time is None:
+                                current_time = "Unknown"
+                                data.setdefault(current_time, {})
+                            data[current_time][sect_id] = {
+                                "coords_text": coords_line.strip(),
+                                "Q": None,
+                                "Q_units": None,
+                                "units": units,
+                                "df": df,
+                            }
+                            line = candidate
+                            break
+                        rows.append(candidate)
+                    continue
+
+                line = _next_nonempty()
+            except EOFError:
+                break
+
+    return data
+
+

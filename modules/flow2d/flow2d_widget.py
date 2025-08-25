@@ -3,12 +3,12 @@
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QTabWidget, QToolBar, QFileDialog, QSplitter,
     QPlainTextEdit, QMessageBox, QToolButton, QPushButton, QMenu, QSpinBox,
-    QHBoxLayout, QLabel, QComboBox, QTableWidget, QTableWidgetItem )  # type: ignore
+    QHBoxLayout, QLabel, QComboBox, QTableWidget, QTableWidgetItem, QProgressDialog, QApplication )  # type: ignore
 from PyQt6.QtWidgets import QListWidget, QListWidgetItem, QStyle   # type: ignore
 
 from PyQt6.QtWidgets import QDialog, QCheckBox
 
-from PyQt6.QtCore import QSize, Qt, QSettings
+from PyQt6.QtCore import QSize, Qt, QSettings , QObject, QThread, pyqtSignal
 from PyQt6.QtGui import QAction  # type: ignore
 from PyQt6.QtGui import QKeySequence, QShortcut # type: ignore
 from PyQt6.QtGui import QImage, QPixmap, QGuiApplication # type: ignore
@@ -24,7 +24,8 @@ import numpy as np
 # modules/flow2d/flow2d_widget.py (añadir)
 from PyQt6.QtCore import Qt  # si no lo tenías
 from matplotlib.collections import LineCollection  # para “cortina” de velocidad
-
+import matplotlib.ticker as mticker
+import time
 
 import os, re, io
 
@@ -32,6 +33,20 @@ from .flow2d_factory import get_parser
 from .flow2d_parsers import ParseResult
 from .flow2d_pipeline import compute_variables, Flow2DState
 from .flow2d_exporters import CSVAllLinesExporter, JSONSummaryExporter
+from .flow2d_parsers import XSECIParser, ParseCancelled
+
+# FUNCIONES AUXILIARES
+def time_label_to_hours(label: str) -> float:
+    """
+    Asume formato consistente (lo generó tu _parse_time_label)
+     "dddd d hh h mm m ss s
+    """
+    parts = label.replace("d", " ").replace("h", " ").replace("m", " ").replace("s", " ").split()
+    d, h, m, s = map(int, parts)
+    return d * 24.0 + h + m / 60.0 + s / 3600.0
+
+
+## CLASES AUXILIARES
 
 class PlotCanvas(FigureCanvas):
     """
@@ -63,13 +78,7 @@ class PlotCanvas(FigureCanvas):
             # left/right: deja sitio a colorbar fija; bottom: para xlabel + leyenda
             self.fig.subplots_adjust(left=0.08, right=0.86, top=0.92, bottom=0.34)
 
-    """def _setup(self):
-        self.ax.set_title("Plano X-Y (XSECS)")
-        self.ax.set_xlabel("X")
-        self.ax.set_ylabel("Y")
-        self.ax.grid(True, linestyle=":", alpha=0.6)
-        # deja espacio para la barra y la leyenda
-        self.fig.subplots_adjust(right=0.86, bottom=0.35)"""
+
 
     def clear(self):
         """Limpia el eje principal y gestiona el colorbar sin romper la geometría."""
@@ -459,11 +468,18 @@ class XSECSSectionTab(_BaseSectionTab):
             self._plot_single(sec_id, clear=False)
         self.canvas.finalize(show_legend=True)
 
-
+#CLASS XSECITab
 class XSECITab(_BaseSectionTab):
     """XSECI: selector de tiempo + ID, tabla y gráfico perfil (terreno/agua + velocidad)."""
+    # ⬅️ nueva señal: manda el ParseResult (o None si vacías)
+    dataLoaded = pyqtSignal(object)  # ParseResult
+    # bandera de cancelación a nivel de instancia
+    
+
     def __init__(self):
         super().__init__("XSECI", "XSECI")
+        self._cancel_flag = False #opcional?
+        self.result = None   # asegúrate de tener este atributo
 
         # Panel de selección (tiempo + id)
         sel = QWidget(self)
@@ -535,7 +551,7 @@ class XSECITab(_BaseSectionTab):
         # --- toggle 1:1 ---
         self.btn_aspect = QPushButton("Escala 1:1")
         self.btn_aspect.setCheckable(True)
-        self.btn_aspect.setToolTip("Alternar entre vista estética y 1:1")
+        self.btn_aspect.setToolTip("Alternar entre vista estética y 1:1,  Atajo: 1")
         self.btn_aspect.toggled.connect(self._toggle_aspect_mode)
         sel_lay.addSpacing(12)
         sel_lay.addWidget(self.btn_aspect)     # <— usa sel_lay, no top_controls_layout
@@ -567,6 +583,7 @@ class XSECITab(_BaseSectionTab):
         btn_copy.setIconSize(QSize(18, 18))
         btn_copy.setToolTip("Copiar imagen al portapapeles")
         btn_copy.clicked.connect(self._copy_to_clipboard)
+        
 
         # Exportar lote
         btn_batch = QToolButton()
@@ -625,7 +642,89 @@ class XSECITab(_BaseSectionTab):
         QShortcut(QKeySequence("Ctrl+E"),     self, activated=self._export_csv)
 
 
+### Modificacion para lectura de proceso de abrir XSECI.
+    def _abrir_xseci(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Abrir XSECI", self._last_dir(), "XSECI (*.XSECI *.xseci)")
+        if not path:
+            return
+        self._save_last_dir(os.path.dirname(path) + os.sep)
+        self._cargar_xseci_async(path)
 
+    def _cargar_xseci_async(self, path: str):
+        # UI: diálogo de progreso
+        self._prog = QProgressDialog("Cargando XSECI...", "Cancelar", 0, 100, self)
+        self._prog.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self._prog.setAutoClose(False)
+        self._prog.setAutoReset(False)
+        self._prog.setMinimumDuration(300)  # ms
+
+        # Hilo + worker
+        self._thr = QThread(self)
+        self._wk  = XSECIWorker(path)
+        self._wk.moveToThread(self._thr)
+
+        # Conexiones
+        self._thr.started.connect(self._wk.run)
+        self._wk.progress.connect(self._on_load_progress)
+        self._wk.finished.connect(self._on_load_finished)
+        self._wk.failed.connect(self._on_load_failed)
+        self._wk.cancelled.connect(self._on_load_cancelled)
+
+        # Cancelación desde el diálogo
+        self._prog.canceled.connect(self._wk.request_cancel)
+
+        # Limpieza
+        self._wk.finished.connect(self._cleanup_worker)
+        self._wk.failed.connect(self._cleanup_worker)
+        self._wk.cancelled.connect(self._cleanup_worker)
+
+        self._thr.start()
+
+    def _on_load_progress(self, done: int, total: int):
+        # actualiza barra (si total=0, pon modo “indeterminado”)
+        if total <= 0:
+            self._prog.setRange(0, 0)
+        else:
+            self._prog.setRange(0, total)
+            self._prog.setValue(done)
+
+    def _on_load_finished(self, result):
+        self._prog.close()
+        self.result = result
+        # opcional: computar variables derivadas
+        self.state = compute_variables(self.result)
+        # poblar combos
+        times = self.result.meta.get("times", []) if isinstance(self.result, ParseResult) else sorted(self.result.keys())
+        self.cbo_time.blockSignals(True)
+        self.cbo_time.clear()
+        self.cbo_time.addItems(times)
+        self.cbo_time.blockSignals(False)
+        if times:
+            self.cbo_time.setCurrentIndex(0)
+            self._populate_ids_for_time(times[0])
+
+    def _on_load_failed(self, msg: str):
+        self._prog.close()
+        QMessageBox.critical(self, "Error", f"No se pudo cargar el XSECI:\n{msg}")
+
+    def _on_load_cancelled(self):
+        self._prog.close()
+        QMessageBox.information(self, "Cargar XSECI", "Operación cancelada por el usuario.")
+
+    def _cleanup_worker(self):
+        try:
+            self._thr.quit()
+            self._thr.wait(1500)
+        except Exception:
+            pass
+        self._wk = None
+        self._thr = None
+        self._prog = None
+
+
+
+
+### Fin de modificación
 
 
     def _time_prev(self):
@@ -659,24 +758,6 @@ class XSECITab(_BaseSectionTab):
         sec = self.result.data.get(t, {}).get(s) if (t and s) else None
         return None if not sec else sec.get("df")
 
-    """def _export_csv(self):
-        import pandas as pd
-        df = self._current_df()
-        if df is None or df.empty:
-            QMessageBox.warning(self, "Exportar", "No hay datos para exportar.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Guardar tabla CSV", f"{self.cbo_id.currentText()}_{self.cbo_time.currentText()}.csv",
-            "CSV (*.csv)"
-        )
-        if not path:
-            return
-        try:
-            df.to_csv(path, index=False)
-            QMessageBox.information(self, "Exportar", "CSV guardado correctamente.")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"No se pudo guardar:\n{e}")
-    """
 
     def _export_csv(self):
         """Exporta la tabla actual a CSV."""
@@ -870,23 +951,66 @@ class XSECITab(_BaseSectionTab):
             QMessageBox.critical(self, "Error", f"Fallo en exportación masiva:\n{e}")
 
 
+    
 
-    # --- Sobrescribe: cargar archivo ---
     def _cargar_y_mostrar(self, ruta: str):
         self.result = self.parser.parse(ruta)
-        self.state = compute_variables(self.result)
+               
+        
+        parser = XSECIParser()
 
-        # Poblar tiempos
+        # 1) Diálogo de progreso
+        dlg = QProgressDialog("Leyendo XSECI…", "Cancelar", 0, 100, self)
+        dlg.setWindowTitle("Cargando")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)  # muéstralo enseguida
+        dlg.setValue(0)
+        dlg.show()
+        QApplication.processEvents()         # <- DALE AIRE A LA GUI
+
+        # 2) Estado cancelado (cerrado sobre mutable)
+        cancelled = {"val": False}
+
+        def cancel_cb() -> bool:
+            # si el usuario pulsó “Cancelar”
+            val = dlg.wasCanceled()
+            cancelled["val"] = cancelled["val"] or val
+            return cancelled["val"]
+
+        def progress_cb(done: int, total: int):
+            # actualizar barra (0..100)
+            pct = int(done / total * 100) if total else 0
+            dlg.setValue(pct)
+            QApplication.processEvents()  # permite refrescar y procesar clicks
+
+        try:
+            # 3) Llamar al parser con callbacks
+            self.result = parser.parse(ruta, progress_cb=progress_cb, cancel_cb=cancel_cb)
+
+        except ParseCancelled:
+            dlg.close()
+            QMessageBox.information(self, "Cancelado", "Lectura cancelada por el usuario.")
+            return
+        except Exception as e:
+            dlg.close()
+            QMessageBox.critical(self, "Error", f"No se pudo leer el archivo:\n{e}")
+            return
+        finally:
+            dlg.close()
+
+        # 4) Si todo OK, continuar como antes
+        self.state = compute_variables(self.result)
         times = self.result.meta.get("times", [])
         self.cbo_time.blockSignals(True)
         self.cbo_time.clear()
         self.cbo_time.addItems(times)
         self.cbo_time.blockSignals(False)
-
-        # Forzar carga de primer tiempo
         if times:
             self.cbo_time.setCurrentIndex(0)
             self._populate_ids_for_time(times[0])
+
+        # 🔔 avisa a quien le interese (Flow2DWidget/XSECH)
+        self.dataLoaded.emit(self.result)
 
     def _populate_ids_for_time(self, time_label: str, preferred_id: str | None = None) -> str | None:
         """Llena el combo de IDs para el tiempo seleccionado y carga una sola vez."""
@@ -1007,112 +1131,131 @@ class XSECITab(_BaseSectionTab):
 
     def _plot_profile(self, df, title: str = ""):
         """Dibuja Terreno (STATION vs BEDEL), Agua (STATION vs WSEL) y cortina coloreada por VEL_NORM."""
+        # 1) Limpiar el lienzo y validar datos
         self.canvas.clear()
-        if df is None or df.empty:
-            self.canvas.ax.set_title(title or "Sin datos"); self.canvas.draw_idle(); return
+        ax = self.canvas.ax
+        if (df is None) or df.empty: 
+            ax.set_title(title or "Sin datos")
+            self.canvas.draw_idle()
+            return
 
+        # 2) Obtener columnas de forma robusta (acepta variantes de encabezado)
+        #_get_col intenta con varios candidatos y fallback por prefijo
         # Obtén columnas (robusto ante nombres ligeramente distintos)
         st = self._get_col(df, "STATION(m)", "STATION")
         bed = self._get_col(df, "BEDEL(m)", "BEDEL")
         wsl = self._get_col(df, "WSEL(m)", "WSEL")
         vel = self._get_col(df, "VEL_NORM(m/s)", "VEL_NORM")
 
-        if st is None or bed is None:
-            self.canvas.ax.set_title("Faltan columnas STATION/BEDEL"); self.canvas.draw_idle(); return
+        # Terreno y estación son imprescindibles para dibujar el perfil
+        if (st is None) or (bed is None):
+            self.canvas.ax.set_title("Faltan columnas STATION/BEDEL")
+            self.canvas.draw_idle()
+            return
 
+        # 3) Asegurar que las series sean arreglos NumPy y queden alineadas
+        # (evita errores si alguna serie es más larga)
+        st  = np.asarray(st,  dtype=float)
+        bed = np.asarray(bed, dtype=float)
+        n_common = min(len(st), len(bed))
+        st, bed = st[:n_common], bed[:n_common]
+        
+        if (wsl is not None):
+            wsl = np.asarray(wsl, dtype=float)[:n_common]
+        if (vel is not None):
+            vel = np.asarray(vel, dtype=float)[:n_common]
+
+        # 4) Trazos base: primero agua (debajo), luego terreno (encima)
+        #    — Colores definidos: WSEL celeste, BEDEL marrón
         ax = self.canvas.ax
         # Asegura que las longitudes coincidan
-        if wsl is not None:
+        if (wsl is not None):
             ax.plot(st, wsl, linewidth=2, color="#00AEEF", label="Nivel (WSEL)", zorder=2)   # celeste cielo
         ax.plot(st, bed, linewidth=2.5, color="#8B5A2B", label="Terreno (BEDEL)", zorder=3)   # marrón tierra
 
-        # Cortina coloreada por velocidad (segmentos verticales)
-        if wsl is not None and vel is not None:
+        # 5) Cortina coloreada por velocidad (si hay wsl y vel)
+        if (wsl is not None) and (vel is not None):
             # Asegura longitudes compatibles
-            n = min(len(st), len(bed), len(wsl), len(vel))
-            st2, bed2, wsl2, vel2 = st[:n], bed[:n], wsl[:n], vel[:n]
-
             segs = np.stack([
-                np.column_stack([st2, bed2]),
-                np.column_stack([st2, wsl2])
-            ], axis=1)
+                np.column_stack([st, bed]),
+                np.column_stack([st, wsl])], 
+                axis=1
+            )
 
-            lc = LineCollection(segs, cmap="viridis", array=vel2, linewidths=2, alpha=0.85)
+            lc = LineCollection(segs, cmap="viridis", array=vel, linewidths=2, alpha=0.85, zorder=1)
             ax.add_collection(lc)
 
             # ✅ UNA sola línea: crea/actualiza el colorbar en el cax fijo, sin cambiar layout
             self.canvas.get_or_update_colorbar(lc, label="Velocidad (m/s)")
+        else:
+            # Si no hay velocidad, asegúrate de no dejar colorbar “huérfano”
+            if getattr(self.canvas, "_cbar", None):
+                try:
+                    self.canvas._cbar.remove()
+                except Exception:
+                    pass
+                self.canvas._cbar = None
 
+        # 6) Títulos y etiquetas de ejes
         ax.set_title(title or "Perfil XSECI")
-        ax.set_xlabel("Station (m)", labelpad=10)  # un poco más de espacio
+        ax.set_xlabel("Distancia (m)", labelpad=10)  # un poco más de espacio
         ax.set_ylabel("Elevación (m)")
 
-        # Mantener proporción rectangular estable (alto/ancho)
-        try:
-            ax.set_aspect("auto")
-            ax.set_box_aspect(0.6)   # 0.6 = alto 60% del ancho (ajústalo a gusto: 0.5..0.8)
-        except Exception:
-            pass
 
-        # Asegurar un mínimo de "altura" visible (por si el perfil es muy plano)
-        y_vals = []
-        if bed is not None: y_vals.extend(bed.tolist())
-        if wsl is not None: y_vals.extend(wsl.tolist())
+        # 7) Altura mínima visible (por si el perfil es muy "plano")
+
+        y_vals = [*bed.tolist()]
+        if bed is not None: 
+            y_vals.extend(bed.tolist())
+        if wsl is not None: 
+            y_vals.extend(wsl.tolist())
         if y_vals:
-            
-            y_min, y_max = np.nanmin(y_vals), np.nanmax(y_vals)
+            y_min, y_max = float(np.nanmin(y_vals)), float(np.nanmax(y_vals))
             span = y_max - y_min
             min_span = 1.0  # mínimo en unidades de elevación (m). Ajusta según tus datos
             if span < min_span:
                 pad = (min_span - span) / 2 or 0.5
                 ax.set_ylim(y_min - pad, y_max + pad)
 
-        # Aplicar modo de aspecto
+        # 8) Aspecto (proporción). Modo 1:1 vs “pretty”
         if getattr(self, "aspect_mode", "pretty") == "equal":
-            self._apply_equal_aspect_custom(ax, st, bed, wsl)
-        else:
-            self._apply_pretty_aspect(ax)
-
-
-
-        ax.grid(True, linestyle=":", alpha=0.6)
-        
-        """# --- leyenda debajo del eje X, pero anclada a la FIGURA ---
-        fig = self.canvas.fig
-        bbox = ax.get_position()                   # BBox del eje en coords de figura
-        x_center = 0.5 * (bbox.x0 + bbox.x1)       # centro horizontal del eje
-        y_below  = bbox.y0 - 0.06                  # 0.06 por debajo del borde del eje"""
-
-        ax.legend(
-            loc="upper center",
-            bbox_to_anchor=(0.5, -0.40),
-            bbox_transform=ax.transAxes,        # << CLAVE: coordenadas de figura
-            ncol=2,
-            fontsize=8,
-            frameon=True,
-            borderaxespad=0.4,
-        )
-        ax.set_xlabel("Station (m)", labelpad=10)  # un poco de aire sobre la leyenda
-
-        # Ajustes para que no se “achique” o se pierda escala
-        if self.aspect_mode == "equal":
+            # 1:1 y límites coherentes sin aplastar
             (xl, xu), (yl, yu) = self._apply_equal_aspect_custom(ax, st, bed, wsl)
-            # si añadiste la LineCollection después, reafirma límites:
-            ax.set_xlim(xl, xu)
-            ax.set_ylim(yl, yu)
-            # y apaga autoscale para que no te lo cambie nadie
             ax.set_autoscale_on(False)
             ax.set_autoscalex_on(False)
             ax.set_autoscaley_on(False)
         else:
-            ax.set_aspect("auto")
-            try: ax.set_box_aspect(0.6)
-            except Exception: pass
+            # Vista “bonita”: relación caja estable y márgenes suaves
+            self._apply_pretty_aspect(ax)
+            try:
+                ax.set_aspect("auto")
+                ax.set_box_aspect(0.6)  # alto ≈ 60% del ancho (ajústalo si quieres)
+            except Exception:
+                pass
             ax.autoscale(enable=True, tight=True)
-            ax.margins(0.05)  # un poco de margen para que no se pegue al borde
-         
+            ax.margins(0.05)
+
+        # Mostrar leyenda solo si hay al menos 1 línea con label
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            # Asegura que la leyenda no se superponga al gráfico
+            ax.legend(
+                loc="upper center",
+                bbox_to_anchor=(0.5, -0.25),
+                bbox_transform=ax.transAxes,        # << CLAVE: coordenadas de figura
+                ncol=2,
+                fontsize=8,
+                frameon=True,
+                borderaxespad=0.3,
+            )
+
+
+        # 9) Cuadrícula y render final
+        ax.grid(True, linestyle=":", alpha=0.6)
         self.canvas.draw_idle()
 
+
+  
     def _apply_pretty_aspect(self, ax):
         """Vista estética: rectangular estable."""
         try:
@@ -1341,6 +1484,382 @@ class BatchExportDialog(QDialog):
         ts = [i.text() for i in self.lst_times.selectedItems()]
         ss = [i.text() for i in self.lst_ids.selectedItems()]
         return ts, ss, self.chk_cartesian.isChecked()
+class XSECIWorker(QObject):
+    progress = pyqtSignal(int, int)   # done, total
+    finished = pyqtSignal(object)     # result
+    failed   = pyqtSignal(str)
+    cancelled= pyqtSignal()
+
+    def __init__(self, path: str):
+        super().__init__()
+        self._path = path
+        self._cancel = False
+
+    def request_cancel(self):
+        self._cancel = True
+
+    def _cancel_cb(self) -> bool:
+        return self._cancel
+
+    def _progress_cb(self, done: int, total: int):
+        self.progress.emit(done, total)
+
+    def run(self):
+        try:
+            from .flow2d_parsers import parse_xseci, ParseCancelled
+            result = parse_xseci(self._path,
+                                 progress_cb=self._progress_cb,
+                                 cancel_cb=self._cancel_cb)
+            if self._cancel:
+                self.cancelled.emit()
+            else:
+                self.finished.emit(result)
+        except ParseCancelled:
+            self.cancelled.emit()
+        except Exception as e:
+            self.failed.emit(str(e))
+
+#CLASS XSECH
+class XSECHidrogramaTab(QWidget):
+    """
+    Hidrogramas por sección:
+      - Arriba: gráfico (horas vs Q)
+      - Abajo: tabla (tiempo vs columnas de secciones)
+      - Fuente de caudal: 'XSECI' o 'Ajustados'
+      - Multi-selección de secciones a graficar
+    """
+    def __init__(self):
+        super().__init__()
+
+        # --- Estado interno (se llena al recibir datos) ---
+        self._times_labels: list[str] = []
+        self._times_hours: np.ndarray | None = None   # shape (T,)
+        self._sections: list[str] = []                # ids ordenados
+        self._Q_xseci: np.ndarray | None = None       # shape (T, S)
+        self._Q_adj:   np.ndarray | None = None       # shape (T, S)
+
+        # --- UI raíz ---
+        root = QVBoxLayout(self)
+
+        # 1) Toolbar superior (fuente de caudales + acciones propias)
+        tb = QToolBar("Hidrograma", self)
+        tb.setIconSize(QSize(18, 18))
+        root.addWidget(tb)
+        self._topbar = tb          # <-- alias para compatibilidad con código previo
+
+        tb.addWidget(QLabel("Fuente:"))
+        self.cbo_source = QComboBox()
+        self.cbo_source.addItems(["Caudales XSECI", "Caudales ajustados"])
+        tb.addWidget(self.cbo_source)
+        tb.addSeparator()
+
+        # Acción eje Y secundario (espejo)
+        self.ax2 = None                # eje Y secundario (twinx)
+        self._cid_ylim = None          # id del callback para sincronizar límites/ticks
+        self.act_y2 = QAction("Eje Y2", self, checkable=True)
+        self.act_y2.setToolTip("Activar eje vertical secundario (espejo)")
+        self.act_y2.toggled.connect(self._toggle_y2)
+        tb.addAction(self.act_y2)
+
+        # 2) Barra de navegación de Matplotlib (como widget debajo del toolbar)
+        self.canvas = PlotCanvas(self, use_colorbar=False)
+        self.nav = NavigationToolbar(self.canvas, self)
+        self.nav.setIconSize(QSize(18, 18))
+        root.addWidget(self.nav)   # <- opción simple y limpia
+        # Si la quisieras dentro de la toolbar superior, sería:
+        # tb.addWidget(self.nav)
+
+        # 3) Lista de secciones a graficar (multi-selección)
+        list_row = QWidget(self)
+        list_lay = QHBoxLayout(list_row); list_lay.setContentsMargins(0, 0, 0, 0)
+        list_lay.addWidget(QLabel("Secciones:"))
+        self.lst_sections = QListWidget()
+        self.lst_sections.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.lst_sections.setMaximumHeight(90)
+        list_lay.addWidget(self.lst_sections, 1)
+        root.addWidget(list_row)
+
+        # 4) Splitter con gráfico arriba y tabla abajo
+        split = QSplitter(self)
+        split.setOrientation(Qt.Orientation.Vertical)
+        split.addWidget(self.canvas)
+
+        self.table = QTableWidget(self)
+        split.addWidget(self.table)
+
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        root.addWidget(split)
+
+        # Señales mínimas
+        self.cbo_source.currentIndexChanged.connect(self._refresh_plot)
+        self.lst_sections.itemSelectionChanged.connect(self._refresh_plot)
+
+        # Eje espejo (se creará on‑demand)
+        self.ax2 = None
+
+    # ------------ Helpers para grafica -----------------
+    def _ensure_ax2(self):
+        """Crea el eje Y secundario si no existe."""
+        if getattr(self, "ax2", None) is None:
+            self.ax2 = self.canvas.ax.twinx()
+            self.ax2.grid(False)
+            self.ax2.set_ylabel("Caudal (m³/s) [Y2]")
+            # pequeño detalle de estilo para diferenciar
+            self.ax2.tick_params(axis='y', labelcolor="#5a7")
+            # si usas colorbar en este tab, no afecta
+
+    def _remove_ax2(self):
+        """Elimina el eje Y2 si existe."""
+        if getattr(self, "ax2", None) is not None:
+            try:
+                self.ax2.remove()
+            except Exception:
+                pass
+            self.ax2 = None
+
+    def _toggle_y2(self, on: bool):
+        """existe."""# ✅ ahora `on` está definido como argumento
+        if on:
+            if self.ax2 is None or not self.ax2.figure:
+                self.ax2 = self.canvas.ax.twinx()
+                self.ax2.grid(False)
+            # engancha sincronización de límites y ticks
+            self._attach_y2_sync()
+            self._sync_y2()  # sincroniza ahora mismo
+        else:
+            # suelta el callback y elimina el eje espejo
+            if self._cid_ylim is not None:
+                try:
+                    self.canvas.ax.callbacks.disconnect(self._cid_ylim)
+                except Exception:
+                    pass
+                self._cid_ylim = None
+            if self.ax2 is not None:
+                try:
+                    self.ax2.remove()
+                except Exception:
+                    pass
+                self.ax2 = None
+        self.canvas.draw_idle()
+
+    def _attach_y2_sync(self):
+        """Conecta un callback para mantener Y2 idéntico a Y1 tras zoom/pan/redraw."""
+        if self._cid_ylim is not None:
+            return
+        self._cid_ylim = self.canvas.ax.callbacks.connect(
+            "ylim_changed", lambda ax: self._sync_y2()
+        )
+
+    def _sync_y2(self):
+        """Copia límites, posiciones de ticks y etiquetas del eje principal a Y2."""
+        if self.ax2 is None:
+            return
+        ax1 = self.canvas.ax
+        ax2 = self.ax2
+
+        # 1) mismos límites
+        y0, y1 = ax1.get_ylim()
+        ax2.set_ylim(y0, y1)
+
+        # 2) mismas posiciones de ticks (FixedLocator)
+        ticks = ax1.get_yticks()
+        ax2.yaxis.set_major_locator(mticker.FixedLocator(ticks))
+
+        # 3) mismas etiquetas (FixedFormatter) — respeta formato local
+        labels = [t.get_text() for t in ax1.get_yticklabels()]
+        # Si estuvieran vacías (aún sin render), formatea numéricamente:
+        if not any(labels):
+            labels = [ax1.yaxis.get_major_formatter().format_data(t) for t in ticks]
+        ax2.yaxis.set_major_formatter(mticker.FixedFormatter(labels))
+
+        # 4) mismo texto del eje y sin grid
+        ax2.set_ylabel(ax1.get_ylabel())
+        ax2.grid(False)
+
+
+    # ------------------- API pública -------------------
+    def set_xseci_result(self, res):
+        """Setter llamado desde Flow2DWidget cuando XSECI termina de cargar."""
+        if not res or not getattr(res, "data", None):
+            self._clear_all_ui("Sin datos XSECI")
+            return
+        self._build_from_result(res)
+        self._populate_sections_list()
+        self._populate_table()
+        self._refresh_plot()
+
+
+    # ----------------- CConstrucción de modelo a partir del resultado XSECI -----------------
+    def _build_from_result(self, res):
+        """
+        Construye:
+        - _times_labels: lista de etiquetas "0000d 00h 06m 00s" (ordenada)
+        - _times_hours : ndarray float con horas
+        - _sections    : lista ids ordenados globalmente
+        - _Q_xseci     : matriz T x S con Q leídos (None->NaN)
+        - _Q_adj       : matriz T x S (por ahora 0.0 en todos)
+        """
+        # 1) Tiempos
+        times = list(res.meta.get("times", []))
+        if not times:
+            # Si no estaban en meta, tómalos de las keys para robustez
+            times = sorted(res.data.keys())
+        self._times_labels = times
+        self._times_hours  = np.array([self._time_label_to_hours(t) for t in times], dtype=float)
+
+        # 2) Secciones (unión global)
+        all_ids = sorted({sid for t in res.data for sid in res.data[t].keys()})
+        self._sections = all_ids
+
+        # 3) Matriz Q_xseci (T,S)
+        T, S = len(times), len(all_ids)
+        Q = np.full((T, S), np.nan, dtype=float)
+        for it, t in enumerate(times):
+            sec_map = res.data.get(t, {})
+            for is_, sid in enumerate(all_ids):
+                sec = sec_map.get(sid)
+                if sec is None:
+                    continue
+                val = sec.get("Q")
+                try:
+                    Q[it, is_] = float(val) if val is not None else np.nan
+                except Exception:
+                    Q[it, is_] = np.nan
+        self._Q_xseci = Q
+
+        # 4) Matriz Q ajustados (placeholder = 0.0)
+        self._Q_adj = np.zeros_like(Q)
+
+
+    
+   
+    # ------------------- UI helpers -------------------
+
+    def _populate_sections_list(self):
+        """Llena la lista de secciones y las marca todas seleccionadas por defecto."""
+        self.lst_sections.blockSignals(True)
+        self.lst_sections.clear()
+        for sid in self._sections:
+            item = QListWidgetItem(sid)
+            item.setSelected(True)  # seleccionadas por defecto
+            self.lst_sections.addItem(item)
+        self.lst_sections.blockSignals(False)
+
+    def _populate_table(self):
+        """Tabla: columna 0 = Tiempo (h), columnas 1.. = Q por sección (todas)."""
+        if self._times_hours is None or self._Q_xseci is None:
+            self.table.clearContents(); self.table.setRowCount(0); self.table.setColumnCount(0); return
+
+        times_h = self._times_hours
+        Q = self._current_Q_matrix()  # según fuente
+
+        # Encabezados
+        headers = ["Tiempo (h)"] + self._sections
+        self.table.setColumnCount(len(headers))
+        self.table.setRowCount(len(times_h))
+        self.table.setHorizontalHeaderLabels(headers)
+
+        # Datos
+        for r, th in enumerate(times_h):
+            self.table.setItem(r, 0, QTableWidgetItem(f"{th:.3f}"))
+            for c, sid in enumerate(self._sections, start=1):
+                val = Q[r, c-1]
+                self.table.setItem(r, c, QTableWidgetItem("" if np.isnan(val) else f"{val:.6f}"))
+
+        self.table.resizeColumnsToContents()
+
+    # ----------------- Plot -----------------
+    def _refresh_all(self):
+        """Cambio de fuente de caudales → actualizar todo."""
+        self._populate_table()
+        self._refresh_plot()
+
+
+    def _refresh_plot(self):
+        """Grafica los hidrogramas de las secciones seleccionadas (con eje duplicado a la derecha)."""
+        ax = self.canvas.ax
+        ax.clear()
+
+        if self._times_hours is None:
+            ax.set_title("Sin datos")
+            self.canvas.draw_idle()
+            return
+
+        times_h = self._times_hours
+        Q = self._current_Q_matrix()
+
+        # Secciones seleccionadas
+        selected = [i.text() for i in self.lst_sections.selectedItems()]
+        if not selected:
+            ax.set_title("Seleccione al menos una sección")
+            self.canvas.draw_idle()
+            return
+
+        idx = {sid: i for i, sid in enumerate(self._sections)}
+
+        # Ploteo normal
+        for sid in selected:
+            j = idx.get(sid)
+            if j is None:
+                continue
+            ax.plot(times_h, Q[:, j], label=sid, linewidth=1.8)
+
+        # Configuración estética
+        ax.set_title("Hidrogramas")
+        ax.set_xlabel("Tiempo (h)")
+        ax.set_ylabel("Caudal (m³/s)")
+        ax.grid(True, linestyle=":", alpha=0.6)
+
+        # Leyenda
+        handles, _ = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(loc="upper right", fontsize=9, frameon=False)
+
+        # --- 👇 eje duplicado (espejo)
+        if self.ax2 is not None:
+            self.ax2.set_ylim(self.canvas.ax.get_ylim())
+            self.ax2.set_yticks(self.canvas.ax.get_yticks())
+            self.ax2.set_ylabel(self.canvas.ax.get_ylabel())
+            self._sync_y2()
+
+        
+        self.canvas.draw_idle()
+
+
+
+    def _current_Q_matrix(self) -> np.ndarray:
+        """Devuelve la matriz Q según la fuente seleccionada."""
+        if self.cbo_source.currentIndex() == 0:
+            return self._Q_xseci if self._Q_xseci is not None else np.empty((0,0))
+        return self._Q_adj   if self._Q_adj   is not None else np.empty((0,0))
+
+    def _time_label_to_hours(self, s: str) -> float:
+        """
+        Convierte '0000d 00h 06m 00s' → horas (float).
+        Si tus labels vinieran como '0000 days, 00 hours, 06 min.,00 secs.' 
+        adapta el regex según corresponda.
+        """
+        import re
+        m = re.search(r"(\d+)d\s+(\d+)h\s+(\d+)m\s+(\d+)s", s)
+        if not m:
+            # fallback: 0.0 h si formato inesperado
+            return 0.0
+        d, h, mm, ss = map(int, m.groups())
+        return d*24.0 + h + mm/60.0 + ss/3600.0
+    
+    def _clear_all_ui(self, title: str):
+        self._times_labels = []
+        self._times_hours  = None
+        self._sections     = []
+        self._Q_xseci = None
+        self._Q_adj   = None
+        self.lst_sections.clear()
+        self.table.clear()
+        self.table.setRowCount(0); self.table.setColumnCount(0)
+        self.canvas.clear(); self.canvas.ax.set_title(title); self.canvas.draw_idle()
+
+# --- WIDGET RAÍZ CON TABS ---
 
 class Flow2DWidget(QWidget):
     def __init__(self):
@@ -1348,10 +1867,22 @@ class Flow2DWidget(QWidget):
         layout = QVBoxLayout(self)
 
         tabs = QTabWidget()
-        # 🔽 Reemplaza la pestaña XSECS por la versión con combo+tabla
-        tabs.addTab(XSECSSectionTab(), "XSECS")
-        tabs.addTab(XSECITab(), "XSECI")
-        tabs.addTab(_BaseSectionTab("XSECH", "XSECH"), "XSECH")
 
+        xsecs_tab  = XSECSSectionTab()
+        xseci_tab  = XSECITab()
+        xsech_tab  = XSECHidrogramaTab()
+
+        tabs.addTab(xsecs_tab, "XSECS")
+        tabs.addTab(xseci_tab, "XSECI")
+        tabs.addTab(xsech_tab, "XSECH")
+
+        # 🔗 CONEXIÓN CLAVE: cuando XSECI cargue, XSECH recibe el ParseResult
+        xseci_tab.dataLoaded.connect(xsech_tab.set_xseci_result)
+        
+        # (opcional) si al crear el widget XSECI ya tenía algo (p.ej. restaurado),
+        # pásalo inmediatamente:
+        if getattr(xseci_tab, "result", None):
+            xsech_tab.set_xseci_result(xseci_tab.result)
+        
         layout.addWidget(tabs)
         self.setLayout(layout)

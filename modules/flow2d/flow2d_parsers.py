@@ -7,7 +7,7 @@ import os
 # Import real del lector XSECS (ya actualizado por ti)
 from .flow2d_xsecs import parse_xsecs  # debe estar en el PYTHONPATH del proyecto
 
-from .flow2d_xseci import parse_xseci  # ⬅️ NUEVO
+from .flow2d_xseci import parse_xseci, ParseCancelled  # ⬅️ NUEVO
 
 @dataclass
 class ParseResult:
@@ -28,20 +28,19 @@ class XSECIParser(BaseParser):
     """Parser para .XSECI."""
     tipo = "XSECI"
 
-    def parse(self, path: str) -> ParseResult:
+    def parse(self, path: str, progress_cb=None, cancel_cb=None) -> ParseResult:
         print(f"[{self.tipo}] Iniciando parseo: {path}")
         if not isinstance(path, str) or not path.strip():
             raise ValueError(f"[{self.tipo}] Ruta inválida: {path!r}")
         if not os.path.isfile(path):
             raise FileNotFoundError(f"[{self.tipo}] No existe el archivo: {path}")
 
-        data = parse_xseci(path)
+        data = parse_xseci(path, progress_cb=progress_cb, cancel_cb=cancel_cb)
         times = list(data.keys())
         ids = sorted({sid for t in times for sid in data[t].keys()})
         meta = {"type": self.tipo, "source": path, "times": times, "ids": ids}
         print(f"[{self.tipo}] OK: tiempos={len(times)}, secciones únicas={len(ids)}")
         return ParseResult(meta=meta, data=data)
-
 
 class XSECSParser(BaseParser):
     """Parser para archivos .XSECS (secciones transversales)."""
