@@ -1528,6 +1528,9 @@ class XSECHidrogramaTab(QWidget):
       - Fuente de caudal: 'XSECI' o 'Ajustados'
       - Multi-selección de secciones a graficar
     """
+    
+    
+
     def __init__(self):
         super().__init__()
 
@@ -1538,6 +1541,10 @@ class XSECHidrogramaTab(QWidget):
         self._Q_xseci: np.ndarray | None = None       # shape (T, S)
         self._Q_adj:   np.ndarray | None = None       # shape (T, S)
 
+        # Matrices T×S por métrica
+        # claves: "Q_XSECI", "Q_AJUST", "Flow_Width", "Depth_Ave", "Flow_Elev_Ave", "Velocity_Ave", "Q_Flow"
+        self._matrices: dict[str, np.ndarray] = {}
+
         # --- UI raíz ---
         root = QVBoxLayout(self)
 
@@ -1547,11 +1554,23 @@ class XSECHidrogramaTab(QWidget):
         root.addWidget(tb)
         self._topbar = tb          # <-- alias para compatibilidad con código previo
 
+        # Fuente de series a graficar
         tb.addWidget(QLabel("Fuente:"))
         self.cbo_source = QComboBox()
-        self.cbo_source.addItems(["Caudales XSECI", "Caudales ajustados"])
+        # claves de usuario (texto visible) → claves internas
+        self._source_items = [
+            ("Caudales XSECI",    "Q_XSECI"),
+            ("Caudales ajustados","Q_AJUST"),
+            ("Ancho de flujo",    "Flow_Width"),
+            ("Tirante promedio",  "Depth_Ave"),
+            ("Cota agua prom.",   "Flow_Elev_Ave"),
+            ("Velocidad prom.",   "Velocity_Ave"),
+            ("Q calculado (test)","Q_Flow"),
+        ]
+        self.cbo_source.addItems([t for (t, _) in self._source_items])
         tb.addWidget(self.cbo_source)
         tb.addSeparator()
+        self.cbo_source.currentIndexChanged.connect(self._on_source_changed)
 
         # Acción eje Y secundario (espejo)
         self.ax2 = None                # eje Y secundario (twinx)
@@ -1677,17 +1696,89 @@ class XSECHidrogramaTab(QWidget):
         ax2.set_ylabel(ax1.get_ylabel())
         ax2.grid(False)
 
+    def _to_hours_array(self, time_labels: list[str]) -> np.ndarray:
+        """Convierte ['0000d 00h 06m 00s', ...] a np.array([horas,...])."""
+        out = []
+        for tl in time_labels:
+            # tolerante: busca d,h,m,s en el string
+            m = re.search(r"(\d+)d\s+(\d+)h\s+(\d+)m\s+(\d+)s", tl)
+            if not m:
+                out.append(np.nan)
+                continue
+            d, h, mi, s = map(int, m.groups())
+            hours = d*24 + h + mi/60 + s/3600
+            out.append(hours)
+        return np.asarray(out, dtype=float)
+
+
 
     # ------------------- API pública -------------------
     def set_xseci_result(self, res):
-        """Setter llamado desde Flow2DWidget cuando XSECI termina de cargar."""
+        """Recibe el resultado de XSECI (dict meta+data) y arma tiempos, secciones y matrices."""
         if not res or not getattr(res, "data", None):
-            self._clear_all_ui("Sin datos XSECI")
+            # deja la pestaña vacía
+            self._times_labels = []
+            self._times_hours  = None
+            self._sections     = []
+            self._matrices     = {}
+            self._populate_sections_list()
+            self._populate_table()
+            self._refresh_plot()
             return
-        self._build_from_result(res)
-        self._populate_sections_list()
-        self._populate_table()
-        self._refresh_plot()
+
+        # 1) tiempos (ordenados)
+        times = sorted(res.data.keys())                   # p.ej. ["0000d 00h 06m 00s", ...]
+        self._times_labels = times
+        # convierte etiqueta → horas (float)
+        self._times_hours = self._to_hours_array(times)
+
+        # 2) secciones (unión ordenada)
+        sections = sorted({sid for t in times for sid in res.data[t].keys()})
+        self._sections = sections
+
+        T, S = len(times), len(sections)
+        def _empty(): return np.full((T, S), np.nan, dtype=float)
+
+        # 3) construir matrices por clave interna
+        mats: dict[str, np.ndarray] = {
+            "Q_XSECI":     _empty(),
+            "Q_AJUST":     _empty(),
+            "Flow_Width":  _empty(),
+            "Depth_Ave":   _empty(),
+            "Flow_Elev_Ave": _empty(),
+            "Velocity_Ave":  _empty(),
+            "Q_Flow":        _empty(),
+        }
+
+        # 4) llenar matrices recorriendo (t, s)
+        sec_idx = {sid: i for i, sid in enumerate(sections)}
+        for it, t in enumerate(times):
+            sec_map = res.data.get(t, {})
+            for sid, info in sec_map.items():
+                js = sec_idx.get(sid)
+                if js is None: 
+                    continue
+                # Q del archivo (puede ser None)
+                q_file = info.get("Q")
+                if q_file is not None:
+                    mats["Q_XSECI"][it, js] = float(q_file)
+                # Q ajustado actual (placeholder): usa el tuyo si ya lo tienes
+                # Por ahora dejamos 0.0 para mostrar la idea
+                mats["Q_AJUST"][it, js] = 0.0
+
+                # Métricas nuevas que ya calcula el parser
+                for k in ("Flow_Width", "Depth_Ave", "Flow_Elev_Ave", "Velocity_Ave", "Q_Flow"):
+                    val = info.get(k)
+                    if val is not None:
+                        mats[k][it, js] = float(val)
+
+        self._matrices = mats
+
+        # 5) UI
+        self._populate_sections_list()  # refresca lista multi-selección
+        self._populate_table()          # tabla con tiempo y columnas por sección, según fuente actual
+        self._refresh_plot()            # plotea según fuente actual
+
 
 
     # ----------------- CConstrucción de modelo a partir del resultado XSECI -----------------
@@ -1731,9 +1822,33 @@ class XSECHidrogramaTab(QWidget):
         # 4) Matriz Q ajustados (placeholder = 0.0)
         self._Q_adj = np.zeros_like(Q)
 
+    def _current_matrix_key(self) -> str | None:
+        """Devuelve la clave interna de la métrica en función del combo 'Fuente'."""
+        idx = self.cbo_source.currentIndex()
+        if idx < 0:
+            return None
+        return self._source_items[idx][1]  # p.ej. "Q_XSECI"
 
-    
-   
+    def _current_matrix(self) -> np.ndarray | None:
+        key = self._current_matrix_key()
+        if not key:
+            return None
+        return self._matrices.get(key)
+
+    def _ylabel_for_key(self, key: str) -> str:
+        return {
+            "Q_XSECI":       "Caudal (m³/s)",
+            "Q_AJUST":       "Caudal (m³/s)",
+            "Flow_Width":    "Ancho (m)",
+            "Depth_Ave":     "Tirante (m)",
+            "Flow_Elev_Ave": "Cota (m s.n.m.)",
+            "Velocity_Ave":  "Velocidad (m/s)",
+            "Q_Flow":        "Caudal (m³/s)",
+        }.get(key, "Valor")
+
+    def _on_source_changed(self, _i: int):
+        self._populate_table()
+        self._refresh_plot()
     # ------------------- UI helpers -------------------
 
     def _populate_sections_list(self):
@@ -1747,27 +1862,28 @@ class XSECHidrogramaTab(QWidget):
         self.lst_sections.blockSignals(False)
 
     def _populate_table(self):
-        """Tabla: columna 0 = Tiempo (h), columnas 1.. = Q por sección (todas)."""
-        if self._times_hours is None or self._Q_xseci is None:
-            self.table.clearContents(); self.table.setRowCount(0); self.table.setColumnCount(0); return
+        """Rellena la tabla con: tiempo(h) + columnas por sección, usando la fuente actual."""
+        M = self._current_matrix()
+        if M is None or self._times_hours is None or not self._sections:
+            self.table.clear()
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            return
 
-        times_h = self._times_hours
-        Q = self._current_Q_matrix()  # según fuente
+        times = self._times_hours
+        sections = self._sections
 
-        # Encabezados
-        headers = ["Tiempo (h)"] + self._sections
-        self.table.setColumnCount(len(headers))
-        self.table.setRowCount(len(times_h))
+        self.table.setRowCount(len(times))
+        self.table.setColumnCount(len(sections) + 1)
+        headers = ["Tiempo (h)"] + sections
         self.table.setHorizontalHeaderLabels(headers)
 
-        # Datos
-        for r, th in enumerate(times_h):
-            self.table.setItem(r, 0, QTableWidgetItem(f"{th:.3f}"))
-            for c, sid in enumerate(self._sections, start=1):
-                val = Q[r, c-1]
-                self.table.setItem(r, c, QTableWidgetItem("" if np.isnan(val) else f"{val:.6f}"))
+        for i, t in enumerate(times):
+            self.table.setItem(i, 0, QTableWidgetItem(f"{t:.3f}"))
+            for j, s in enumerate(sections, start=1):
+                val = M[i, j-1]
+                self.table.setItem(i, j, QTableWidgetItem("" if np.isnan(val) else f"{val:.6g}"))
 
-        self.table.resizeColumnsToContents()
 
     # ----------------- Plot -----------------
     def _refresh_all(self):
@@ -1777,53 +1893,50 @@ class XSECHidrogramaTab(QWidget):
 
 
     def _refresh_plot(self):
-        """Grafica los hidrogramas de las secciones seleccionadas (con eje duplicado a la derecha)."""
-        ax = self.canvas.ax
-        ax.clear()
+        """Grafica la serie seleccionada (fuente) para las secciones seleccionadas."""
+        self.canvas.clear()
 
-        if self._times_hours is None:
-            ax.set_title("Sin datos")
+        if self._times_hours is None or not self._sections:
+            self.canvas.ax.set_title("Sin datos")
+            self.canvas.draw_idle()
+            return
+
+        M = self._current_matrix()
+        if M is None:
+            self.canvas.ax.set_title("No hay datos para la fuente seleccionada")
             self.canvas.draw_idle()
             return
 
         times_h = self._times_hours
-        Q = self._current_Q_matrix()
 
         # Secciones seleccionadas
         selected = [i.text() for i in self.lst_sections.selectedItems()]
         if not selected:
-            ax.set_title("Seleccione al menos una sección")
+            self.canvas.ax.set_title("Seleccione al menos una sección")
             self.canvas.draw_idle()
             return
 
         idx = {sid: i for i, sid in enumerate(self._sections)}
 
-        # Ploteo normal
+        # plot
         for sid in selected:
             j = idx.get(sid)
             if j is None:
                 continue
-            ax.plot(times_h, Q[:, j], label=sid, linewidth=1.8)
+            y = M[:, j]
+            self.canvas.ax.plot(times_h, y, label=sid, linewidth=1.8)
 
-        # Configuración estética
-        ax.set_title("Hidrogramas")
-        ax.set_xlabel("Tiempo (h)")
-        ax.set_ylabel("Caudal (m³/s)")
-        ax.grid(True, linestyle=":", alpha=0.6)
+        key = self._current_matrix_key() or ""
+        self.canvas.ax.set_title("Serie: " + dict(self._source_items)[self.cbo_source.currentText()]
+                                if hasattr(self.cbo_source, "currentText") else "Serie")
+        self.canvas.ax.set_xlabel("Tiempo (h)")
+        self.canvas.ax.set_ylabel(self._ylabel_for_key(key))
+        self.canvas.ax.grid(True, linestyle=":", alpha=0.6)
 
-        # Leyenda
-        handles, _ = ax.get_legend_handles_labels()
+        handles, _ = self.canvas.ax.get_legend_handles_labels()
         if handles:
-            ax.legend(loc="upper right", fontsize=9, frameon=False)
+            self.canvas.ax.legend(loc="upper right", fontsize=9, frameon=False)
 
-        # --- 👇 eje duplicado (espejo)
-        if self.ax2 is not None:
-            self.ax2.set_ylim(self.canvas.ax.get_ylim())
-            self.ax2.set_yticks(self.canvas.ax.get_yticks())
-            self.ax2.set_ylabel(self.canvas.ax.get_ylabel())
-            self._sync_y2()
-
-        
         self.canvas.draw_idle()
 
 
