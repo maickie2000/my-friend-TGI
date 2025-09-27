@@ -23,6 +23,7 @@ dist/
 # Entornos virtuales (si usas en el futuro)
 env/
 venv/
+.venv/
 
 # Configuraciones del sistema
 .DS_Store
