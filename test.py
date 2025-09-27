@@ -4,7 +4,8 @@ def bar(done, total):
     if total:
         print(f"{done/total:6.2%}", end="\r")
 
-data = parse_xseci(r"D:\MILAGROS\TGI\Test.XSECI", progress_cb=bar)
+data = parse_xseci(r"C:\TGI\Test.XSECI", progress_cb=bar)
+#data = parse_xseci(r"D:\MILAGROS\TGI\Test.XSECI", progress_cb=bar)
 
 # Listar tiempos
 print(list(data.keys())[:3])

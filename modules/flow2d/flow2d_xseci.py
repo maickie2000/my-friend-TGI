@@ -223,12 +223,14 @@ def parse_xseci(path: str | Path) -> Dict[str, Dict[str, Any]]:
 def parse_xseci(path: str | Path,
                 progress_cb=None,
                 cancel_cb=None) -> Dict[str, Dict[str, Any]]:
-        
+
     path = Path(path)
+
+    #BARRA DE PROCESO DE LECTURA
     total_bytes = path.stat().st_size if path.exists() else 0
     if progress_cb and total_bytes > 0:
         progress_cb(0, total_bytes)      # tick inicial (0%)
-    
+
     done_bytes = 0
 
     def _tick_progress(new_bytes: int = 0):
@@ -242,7 +244,7 @@ def parse_xseci(path: str | Path,
     data: Dict[str, Dict[str, Any]] = {}
     current_time: str | None = None
 
-       
+
 
     with path.open("r", encoding="utf-8", errors="ignore") as f:
         # leemos línea a línea para medir bytes
