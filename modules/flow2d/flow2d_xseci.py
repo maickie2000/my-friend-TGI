@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 import re
+import numpy as np
 import pandas as pd
 
 _TIME_RE = re.compile(
@@ -20,6 +21,127 @@ class ParseCancelled(Exception):
     """Señal interna para cortar parsing por cancelación del usuario."""
     pass
 
+## Nuevas funciones opcionales? 20250927
+def _normalize_header_name(name: str) -> str:
+    """Quita espacios y paréntesis para comparar encabezados con/ sin unidades."""
+    return name.replace(" ", "").replace("(", "").replace(")", "").upper()
+def _best_match_column(df: pd.DataFrame, candidates: List[str]) -> str | None:
+    """
+    Devuelve el nombre real de columna en df que coincide con alguno de los 'candidates'
+    (tolerando variantes con/ sin unidades). Si no hay match, None.
+    """
+    norm_cols = { _normalize_header_name(c): c for c in df.columns }
+
+    for cand in candidates:
+        norm_cand = _normalize_header_name(cand)
+        # 1) match exacto normalizado
+        if norm_cand in norm_cols:
+            return norm_cols[norm_cand]
+        # 2) match por prefijo razonable (por si hay "STATION" vs "STATIONm")
+        for ncol, orig in norm_cols.items():
+            if ncol.startswith(norm_cand):
+                return orig
+    return None
+def _get_series(df: pd.DataFrame, candidates: List[str]) -> np.ndarray | None:
+    """
+    Intenta extraer una columna (como float) probando nombres con y sin unidades.
+    Devuelve np.ndarray o None si no la encuentra.
+    """
+    col = _best_match_column(df, candidates)
+    if col is None:
+        return None
+    # tolera strings con espacios, etc.
+    try:
+        return pd.to_numeric(df[col], errors="coerce").to_numpy()
+    except Exception:
+        return None
+#Nuevas funcione de calculo:
+def Calc_Flow_Width(df: pd.DataFrame) -> float | None:
+    """
+    Ancho de inundación (valor de prueba):
+    máx(STATION) - mín(STATION) considerando solo filas con DEPTH > 0.
+    """
+    st = _get_series(df, ["STATION(m)", "STATION"])
+    dep = _get_series(df, ["DEPTH(m)", "DEPTH"])
+    if st is None or dep is None:
+        return None
+    mask = (dep > 0) & np.isfinite(st)
+    if not np.any(mask):
+        return 0.0
+    return float(np.nanmax(st[mask]) - np.nanmin(st[mask]))
+
+def Calc_Depth_Ave(df: pd.DataFrame) -> float | None:
+    """
+    Tirante promedio (valor de prueba):
+    promedio(DEPTH) sobre filas con VEL_NORM > 0.
+    """
+    dep = _get_series(df, ["DEPTH(m)", "DEPTH"])
+    vel = _get_series(df, ["VEL_NORM(m/s)", "VEL_NORM"])
+    if dep is None or vel is None:
+        return None
+    mask = (vel > 0)
+    vals = dep[mask]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0
+    return float(np.nanmean(vals))
+
+def Calc_Flow_Elev_Ave(df: pd.DataFrame) -> float | None:
+    """
+    Cota de agua promedio (valor de prueba):
+    promedio(WSEL) sobre filas con VEL_NORM > 0.
+    """
+    wsl = _get_series(df, ["WSEL(m)", "WSEL"])
+    vel = _get_series(df, ["VEL_NORM(m/s)", "VEL_NORM"])
+    if wsl is None or vel is None:
+        return None
+    mask = (vel > 0)
+    vals = wsl[mask]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0
+    return float(np.nanmean(vals))
+
+def Calc_Velocity_Ave(df: pd.DataFrame) -> float | None:
+    """
+    Velocidad promedio (valor de prueba):
+    promedio(VEL_NORM) sobre filas con VEL_NORM > 0.
+    """
+    vel = _get_series(df, ["VEL_NORM(m/s)", "VEL_NORM"])
+    if vel is None:
+        return None
+    vals = vel[vel > 0]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return 0.0
+    return float(np.nanmean(vals))
+
+def Calc_Q_Flow(df: pd.DataFrame) -> float | None:
+    """
+    Caudal (valor de prueba):
+    Q = sum(vel * depth * Δx), con Δx = diff(STATION).
+    Usa filas donde DEPTH>0 y VEL_NORM>0.
+    """
+    st  = _get_series(df, ["STATION(m)", "STATION"])
+    dep = _get_series(df, ["DEPTH(m)", "DEPTH"])
+    vel = _get_series(df, ["VEL_NORM(m/s)", "VEL_NORM"])
+    if st is None or dep is None or vel is None:
+        return None
+
+    # Δx (alínea última con 0 para igualar tamaños)
+    dx = np.diff(st, prepend=st[0])
+    dx[dx < 0] = 0  # por si hay ruido/orden no monótono
+
+    mask = (dep > 0) & (vel > 0) & np.isfinite(dx)
+    if not np.any(mask):
+        return 0.0
+
+    return float(np.nansum(vel[mask] * dep[mask] * dx[mask]))
+
+
+
+
+#############################
 
 def _next_nonempty(it) -> str:
     for line in it:
@@ -223,7 +345,21 @@ def parse_xseci(path: str | Path) -> Dict[str, Dict[str, Any]]:
 def parse_xseci(path: str | Path,
                 progress_cb=None,
                 cancel_cb=None) -> Dict[str, Dict[str, Any]]:
-
+    """
+    Retorna: data[time_label][section_id] = {
+        "coords_text": str,
+        "Q": float | None,         # Q reportado por el archivo (si viene la línea Q=...)
+        "Q_units": str | None,
+        "units": Dict[str,str],    # unidades por columna
+        "df": DataFrame,
+        # --- NUEVAS MÉTRICAS ---
+        "Flow_Width": float | None,
+        "Depth_Ave": float | None,
+        "Flow_Elev_Ave": float | None,
+        "Velocity_Ave": float | None,
+        "Q_Flow": float | None,    # Q calculado (valor de prueba)
+    }
+    """
     path = Path(path)
 
     #BARRA DE PROCESO DE LECTURA
@@ -281,12 +417,13 @@ def parse_xseci(path: str | Path,
         line = first
         while True:
             try:
+                #Cambio de tiempo
                 if line.upper().startswith("TIME:"):
                     current_time = _parse_time_label(line)  # tu función actual
                     data.setdefault(current_time, {})
                     line = _next_nonempty()
                     continue
-
+                #Cambio de sección
                 m = _SECT_RE.search(line)  # tu regex actual
                 if m:
                     sect_id = m.group(2)
@@ -298,11 +435,19 @@ def parse_xseci(path: str | Path,
                     while True:
                         candidate = _next_nonempty()
                         u = candidate.upper()
+                        # Cierre por línea de Q (caso más común)
                         if u.startswith("Q"):
                             q_match = _Q_RE.search(candidate)
                             Q_val   = float(q_match.group(1)) if q_match else None
                             Q_units = q_match.group(2) if (q_match and q_match.group(2)) else None
                             df, units = _build_df_from_rows(header_line, units_line, rows)
+                            # --- NUEVAS MÉTRICAS ---
+                            Flow_Width     = Calc_Flow_Width(df)
+                            Depth_Ave      = Calc_Depth_Ave(df)
+                            Flow_Elev_Ave  = Calc_Flow_Elev_Ave(df)
+                            Velocity_Ave   = Calc_Velocity_Ave(df)
+                            Q_Flow         = Calc_Q_Flow(df)
+
                             if current_time is None:
                                 current_time = "Unknown"
                                 data.setdefault(current_time, {})
@@ -312,14 +457,28 @@ def parse_xseci(path: str | Path,
                                 "Q_units": Q_units,
                                 "units": units,
                                 "df": df,
+                                # nuevas
+                                "Flow_Width": Flow_Width,
+                                "Depth_Ave": Depth_Ave,
+                                "Flow_Elev_Ave": Flow_Elev_Ave,
+                                "Velocity_Ave": Velocity_Ave,
+                                "Q_Flow": Q_Flow,
                             }
                             try:
                                 line = _next_nonempty()
                             except EOFError:
                                 line = ""
                             break
+                        # Cierre por inicio de otra sección o nuevo TIME
                         if u.startswith("CROSS SECTION NO.") or u.startswith("TIME:"):
                             df, units = _build_df_from_rows(header_line, units_line, rows)
+                            # --- NUEVAS MÉTRICAS ---
+                            Flow_Width     = Calc_Flow_Width(df)
+                            Depth_Ave      = Calc_Depth_Ave(df)
+                            Flow_Elev_Ave  = Calc_Flow_Elev_Ave(df)
+                            Velocity_Ave   = Calc_Velocity_Ave(df)
+                            Q_Flow         = Calc_Q_Flow(df)
+
                             if current_time is None:
                                 current_time = "Unknown"
                                 data.setdefault(current_time, {})
@@ -329,12 +488,20 @@ def parse_xseci(path: str | Path,
                                 "Q_units": None,
                                 "units": units,
                                 "df": df,
+                                # nuevas
+                                "Flow_Width": Flow_Width,
+                                "Depth_Ave": Depth_Ave,
+                                "Flow_Elev_Ave": Flow_Elev_Ave,
+                                "Velocity_Ave": Velocity_Ave,
+                                "Q_Flow": Q_Flow,
                             }
                             line = candidate
                             break
+                        # Sigue acumulando filas del bloque de tabla
                         rows.append(candidate)
                     continue
 
+                # Nada especial → próxima línea
                 line = _next_nonempty()
             except EOFError:
                 break
